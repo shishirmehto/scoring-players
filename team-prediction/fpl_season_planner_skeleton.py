@@ -4,103 +4,72 @@
 Generates per–gameweek outputs:
 - Top-5 players by position
 - Captain shortlists (protect/chase modes)
-- Greedy transfer suggestions over a horizon
+- Transfer suggestions (supports two-move bundles)
 
 Data can be loaded from local Vaastav CSVs or the live FPL API with fallbacks.
-Sections and docstrings are provided to keep the module readable.
+Refactored into `season_planner` modules with opponent-split EP and AFCON support.
 """
 
 import argparse, os, json
-import re
-import importlib.util
-from pathlib import Path
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Set
 import pandas as pd
 import numpy as np
 
-try:
-    import requests
-except Exception:
-    requests = None
+# New modular imports
+from season_planner import (
+    data as sp_data,
+    features as sp_features,
+    ep_model as sp_ep,
+    captain as sp_captain,
+    transfers as sp_transfers,
+    chips as sp_chips,
+)
 
 
-def _load_json(path: Optional[str], url: Optional[str] = None):
-    """Load JSON from a local path if present; otherwise from the provided URL.
+def _parse_id_list(text: Optional[str]) -> Set[int]:
+    if not text:
+        return set()
+    parts = [p.strip() for p in str(text).replace(";", ",").split(",") if p.strip()]
+    out: Set[int] = set()
+    for p in parts:
+        try:
+            out.add(int(p))
+        except Exception:
+            continue
+    return out
 
-    Args:
-        path: Local filesystem path to a JSON file.
-        url: HTTP(S) URL to fetch JSON if local path is not provided.
 
-    Raises:
-        RuntimeError: If a URL is provided but the HTTP client is unavailable.
-        FileNotFoundError: If neither a path nor a URL is provided.
-    """
-    if path and os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    if url:
-        if requests is None:
-            raise RuntimeError("requests not available; provide local file instead.")
-        r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
-        r.raise_for_status()
-        return r.json()
-    raise FileNotFoundError("Provide a local path or a URL")
+def _parse_gw_list(text: Optional[str]) -> List[int]:
+    if not text:
+        return []
+    tokens = [t.strip() for t in str(text).replace(";", ",").split(",") if t.strip()]
+    weeks: List[int] = []
+    for tok in tokens:
+        if "-" in tok:
+            try:
+                a, b = tok.split("-", 1)
+                a_i, b_i = int(a), int(b)
+                weeks.extend(list(range(min(a_i, b_i), max(a_i, b_i) + 1)))
+            except Exception:
+                continue
+        else:
+            try:
+                weeks.append(int(tok))
+            except Exception:
+                continue
+    # deduplicate preserving order
+    seen = set()
+    uniq = []
+    for w in weeks:
+        if w not in seen:
+            seen.add(w)
+            uniq.append(w)
+    return uniq
 
 
 def _load_csv(path: Optional[str], url: Optional[str] = None) -> pd.DataFrame:
-    """Load CSV from local path or URL with tolerant parsing fallbacks."""
-    src = path or url
-    if not src:
-        raise FileNotFoundError("Provide a local path or a URL")
-    try:
-        return pd.read_csv(src)
-    except Exception:
-        try:
-            return pd.read_csv(src, engine="python", on_bad_lines="skip")
-        except TypeError:
-            return pd.read_csv(src, engine="python")
-
-
-def _import_module_from_path(module_name: str, file_path: str):
-    """Import a Python module given an absolute file path."""
-    if not os.path.exists(file_path):
-        return None
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None or spec.loader is None:
-        return None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)  # type: ignore[attr-defined]
-    return module
-
-
-def _default_fpl_data_root() -> str:
-    """Return default path to the Vaastav data directory within this repo."""
-    here = os.path.dirname(__file__)
-    return os.path.join(here, "Fantasy-Premier-League", "data")
-
-
-def _latest_available_season(data_root: str) -> Optional[str]:
-    """Pick the lexicographically latest season folder matching YYYY-YY under data_root."""
-    try:
-        candidates = [
-            name
-            for name in os.listdir(data_root)
-            if re.fullmatch(r"\d{4}-\d{2}", name)
-            and os.path.isdir(os.path.join(data_root, name))
-        ]
-        if not candidates:
-            return None
-        return sorted(candidates)[-1]
-    except Exception:
-        return None
-
-
-def _season_paths(data_root: str, season: str) -> Dict[str, str]:
-    base = os.path.join(data_root, season)
-    return {
-        "merged_gw": os.path.join(base, "gws", "merged_gw.csv"),
-        "players_raw": os.path.join(base, "players_raw.csv"),
-    }
+    # Backwards-compat shim; now delegated to season_planner.data
+    return pd.read_csv(path or url)  # type: ignore[arg-type]
 
 
 # ===== Data acquisition and resolution =====
@@ -115,71 +84,8 @@ def load_sources(args):
     - For CSVs, resolve season paths under --fpl-data-root and --season
       If not found and --allow-remote, fall back to GitHub raw URLs
     """
-    # Attempt to import Vaastav getters even though the directory has a hyphen
-    getters_path = os.path.join(
-        os.path.dirname(__file__), "Fantasy-Premier-League", "getters.py"
-    )
-    vaastav_getters = _import_module_from_path("fpl_getters", getters_path)
-
-    # Bootstrap
-    if args.bootstrap or args.bootstrap_url:
-        bs = _load_json(args.bootstrap, args.bootstrap_url)
-    else:
-        if vaastav_getters and hasattr(vaastav_getters, "get_data"):
-            bs = vaastav_getters.get_data()  # type: ignore[attr-defined]
-        else:
-            # fall back to default URL if requests available
-            bs = _load_json(
-                None, "https://fantasy.premierleague.com/api/bootstrap-static/"
-            )
-
-    # Fixtures
-    if args.fixtures or args.fixtures_url:
-        fixtures = _load_json(args.fixtures, args.fixtures_url)
-    else:
-        if vaastav_getters and hasattr(vaastav_getters, "get_fixtures_data"):
-            fixtures = vaastav_getters.get_fixtures_data()  # type: ignore[attr-defined]
-        else:
-            fixtures = _load_json(
-                None, "https://fantasy.premierleague.com/api/fixtures/"
-            )
-
-    # Resolve season file paths for merged_gw and players_raw
-    data_root = args.fpl_data_root or _default_fpl_data_root()
-    season = args.season or _latest_available_season(data_root)
-    season_paths = _season_paths(data_root, season) if season else {"merged_gw": None, "players_raw": None}  # type: ignore[assignment]
-
-    # merged_gw.csv
-    mgw_path_or_url = args.merged_gw or season_paths.get("merged_gw")
-    mgw = None
-    if mgw_path_or_url and os.path.exists(mgw_path_or_url):
-        mgw = _load_csv(mgw_path_or_url)
-    elif args.merged_gw_url:
-        mgw = _load_csv(None, args.merged_gw_url)
-    elif args.allow_remote and season:
-        mgw_url = f"https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/{season}/gws/merged_gw.csv"
-        mgw = _load_csv(None, mgw_url)
-    else:
-        raise FileNotFoundError(
-            "merged_gw.csv not found. Pass --merged-gw or --merged-gw-url or set --season/--fpl-data-root."
-        )
-
-    # players_raw.csv
-    praw_path_or_url = args.players_raw or season_paths.get("players_raw")
-    praw = None
-    if praw_path_or_url and os.path.exists(praw_path_or_url):
-        praw = _load_csv(praw_path_or_url)
-    elif args.players_raw_url:
-        praw = _load_csv(None, args.players_raw_url)
-    elif args.allow_remote and season:
-        praw_url = f"https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/{season}/players_raw.csv"
-        praw = _load_csv(None, praw_url)
-    else:
-        raise FileNotFoundError(
-            "players_raw.csv not found. Pass --players-raw or --players-raw-url or set --season/--fpl-data-root."
-        )
-
-    return bs, fixtures, mgw, praw
+    # Delegate to modular loader
+    return sp_data.load_sources(args)
 
 
 def _minutes60_prob(df_last4: pd.DataFrame) -> float:
@@ -221,66 +127,8 @@ def _saves_per90_last4(df_last4: pd.DataFrame) -> float:
 
 
 def add_player_features(bootstrap: dict, merged_gw: pd.DataFrame) -> pd.DataFrame:
-    """Return player DataFrame enriched with short-horizon form features.
-
-    Computes features from last four appearances in merged_gw (form4, ict4,
-    mins60, returns4, cs4, saves90_4), normalizes numeric fields, and derives
-    `position` and `price`.
-    """
-    elements = pd.DataFrame(bootstrap["elements"])
-    teams = pd.DataFrame(bootstrap["teams"])[["id", "name"]].rename(
-        columns={"id": "team_id", "name": "team_name"}
-    )
-    df = elements.merge(teams, left_on="team", right_on="team_id", how="left")
-
-    mgw = merged_gw.copy()
-    if "element" not in mgw.columns:
-        if "id" in mgw.columns:
-            mgw = mgw.rename(columns={"id": "element"})
-        else:
-            raise ValueError("merged_gw missing 'element' id column")
-
-    if "round" in mgw.columns:
-        mgw["round"] = pd.to_numeric(mgw["round"], errors="coerce")
-
-    feats = []
-    for pid, g in mgw.groupby("element"):
-        g = g.sort_values("round")
-        last4 = g.tail(4)
-        feats.append(
-            {
-                "id": pid,
-                "form4": (
-                    last4["total_points"].astype(float).mean()
-                    if "total_points" in last4.columns and len(last4) > 0
-                    else 0.0
-                ),
-                "ict4": _ict_last4(last4),
-                "mins60": _minutes60_prob(last4),
-                "returns4": _returns_rate_last4(last4),
-                "cs4": _clean_sheet_rate(last4),
-                "saves90_4": _saves_per90_last4(last4),
-            }
-        )
-    feat_df = pd.DataFrame(feats)
-
-    df = df.merge(feat_df, on="id", how="left")
-    for col in [
-        "ep_next",
-        "form",
-        "ict_index",
-        "selected_by_percent",
-        "now_cost",
-        "chance_of_playing_next_round",
-    ]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
-        else:
-            df[col] = 0.0
-
-    df["position"] = df["element_type"].map({1: "GK", 2: "DEF", 3: "MID", 4: "FWD"})
-    df["price"] = (df["now_cost"] / 10.0).fillna(0.0)
-    return df
+    # Delegate to modular feature builder
+    return sp_features.add_player_features(bootstrap, merged_gw)
 
 
 def availability_penalty(status, chance) -> float:
@@ -519,26 +367,10 @@ def captain_shortlist(
     risk_mode: str = "protect",
     top_k: int = 5,
 ) -> pd.DataFrame:
-    """Shortlist captain candidates for `gw` with ownership leverage.
-
-    Protect mode mildly penalizes low-owned picks; chase mode rewards them.
-    """
-    df = ep_by_gw.get(gw, pd.DataFrame()).copy()
-    if df.empty:
-        return df
-    base = players[["id", "selected_by_percent", "position"]].copy()
-    df = df.merge(base, on="id", how="left", suffixes=("", "_pl"))
-    df["ownership"] = df["selected_by_percent"].astype(float) / 100.0
-    df["ownership"] = df["ownership"].fillna(0.0)
-    # Leverage: boost low-ownership when chasing, penalize when protecting
-    if risk_mode == "chase":
-        df["cap_score"] = df["ep"] * (1.0 + (0.30 * (1.0 - df["ownership"])))
-    else:  # protect
-        df["cap_score"] = df["ep"] * (1.0 - (0.20 * (1.0 - df["ownership"])))
-    df.sort_values(["cap_score", "ep"], ascending=False, inplace=True)
-    return df.head(top_k)[
-        ["id", "web_name", "team_name", "position", "ep", "ownership", "cap_score"]
-    ]
+    # Delegate to modular captain selection
+    return sp_captain.captain_shortlist(
+        ep_by_gw, players, gw, risk_mode=risk_mode, top_k=top_k
+    )
 
 
 # ===== Transfer planning helpers =====
@@ -640,130 +472,27 @@ def propose_transfers(
     horizon: int,
     bank: float,
     free_transfers: int,
+    *,
+    allow_two_move: bool = True,
 ) -> Dict[str, object]:
-    """Suggest up to `free_transfers` greedy upgrades over a `horizon` of GWs.
-
-    Replaces the lowest-EP-window XI member with the best affordable upgrade
-    that respects the 3-per-team constraint.
-    """
-    if not current_squad_ids or free_transfers <= 0:
-        return {"suggestions": [], "notes": "No squad provided or 0 FTs"}
-    # Build horizon EP per player (sum over gw window)
-    window = [gw for gw in range(gw_start, gw_start + horizon) if gw in ep_by_gw]
-    if not window:
-        return {"suggestions": [], "notes": "No EP window available"}
-    ep_sum = _build_ep_window(ep_by_gw, window)
-    pool = players.merge(ep_sum, on="id", how="left").fillna({"ep_window": 0.0})
-
-    # Current XI for first GW in window
-    first_gw = window[0]
-    first_df = ep_by_gw[first_gw]
-    _, current_xi_ids = _best_xi_ep_for_squad(current_squad_ids, first_df)
-    if not current_xi_ids:
-        return {"suggestions": [], "notes": "Could not form XI from provided squad"}
-
-    # Greedy loop: replace lowest ep_window XI member with the best affordable upgrade
-    suggestions = []
-    squad_ids = current_squad_ids.copy()
-    team_counts = _squad_team_counts(squad_ids, players)
-    available_bank = float(bank)
-    for _ in range(free_transfers):
-        xi_pool = pool[pool["id"].isin(current_xi_ids)].copy()
-        xi_pool = xi_pool.merge(
-            players[["id", "price", "team_name"]], on="id", how="left"
-        )
-        out_row = xi_pool.nsmallest(1, "ep_window")
-        if out_row.empty:
-            break
-        out_id = int(out_row.iloc[0]["id"])
-        out_price = (
-            float(out_row.iloc[0]["price"])
-            if not pd.isna(out_row.iloc[0]["price"])
-            else 0.0
-        )
-        # Candidates not owned, respect team limit
-        cand = pool[~pool["id"].isin(squad_ids)].copy()
-        cand = cand.merge(
-            players[["id", "web_name", "team_name", "price"]], on="id", how="left"
-        )
-        # Enforce 3-per-team
-        cand = cand[
-            cand.apply(lambda r: team_counts.get(r["team_name"], 0) < 3, axis=1)
-        ]
-        # Budget check
-        cand = cand[cand["price"].fillna(0.0) <= available_bank + out_price + 1e-6]
-        if cand.empty:
-            break
-        # Score candidate by EP gain over window
-        out_epw = (
-            float(out_row.iloc[0]["ep_window"])
-            if not pd.isna(out_row.iloc[0]["ep_window"])
-            else 0.0
-        )
-        cand["ep_gain"] = cand["ep_window"] - out_epw
-        best = cand.sort_values(["ep_gain", "ep_window"], ascending=False).head(1)
-        if best.empty or float(best.iloc[0]["ep_gain"]) <= 0.0:
-            break
-        in_id = int(best.iloc[0]["id"])
-        in_price = (
-            float(best.iloc[0]["price"]) if not pd.isna(best.iloc[0]["price"]) else 0.0
-        )
-        suggestions.append(
-            {
-                "out_id": out_id,
-                "in_id": in_id,
-                "out_name": (
-                    players.loc[players["id"] == out_id, "web_name"].values.tolist()[0]
-                    if (players["id"] == out_id).any()
-                    else ""
-                ),
-                "in_name": (
-                    players.loc[players["id"] == in_id, "web_name"].values.tolist()[0]
-                    if (players["id"] == in_id).any()
-                    else ""
-                ),
-                "ep_gain_window": float(best.iloc[0]["ep_gain"]),
-                "cost_in": in_price,
-                "cost_out": out_price,
-            }
-        )
-        # Apply move to state
-        squad_ids = [pid for pid in squad_ids if pid != out_id] + [in_id]
-        team_counts[best.iloc[0]["team_name"]] = (
-            team_counts.get(best.iloc[0]["team_name"], 0) + 1
-        )
-        out_tm = players.loc[players["id"] == out_id, "team_name"].values.tolist()
-        if out_tm:
-            team_counts[out_tm[0]] = max(0, team_counts.get(out_tm[0], 0) - 1)
-        available_bank = available_bank + out_price - in_price
-        # Recompute current XI for next iteration
-        _, current_xi_ids = _best_xi_ep_for_squad(squad_ids, first_df)
-
-    return {
-        "suggestions": suggestions,
-        "bank_remaining": round(available_bank, 1),
-        "notes": "Greedy 1-step upgrades over EP window",
-    }
+    # Delegate to modular transfer planner
+    return sp_transfers.propose_transfers(
+        players=players,
+        ep_by_gw=ep_by_gw,
+        current_squad_ids=current_squad_ids,
+        gw_start=gw_start,
+        horizon=horizon,
+        bank=bank,
+        free_transfers=free_transfers,
+        allow_two_move=allow_two_move,
+    )
 
 
 def chip_heuristics(
     gw: int, suggestions: Dict[str, object], free_transfers: int
 ) -> str:
-    """Light-touch chip suggestion based on GW and projected gains."""
-    # Simple placeholders aligned with the brief; adapt in-season with BGW/DGW detection
-    if gw == 16:
-        return (
-            "GW16 AFCON top-up: you have up to 5 free transfers – use as mini-wildcard."
-        )
-    if (
-        7 <= gw <= 12
-        and free_transfers < 2
-        and suggestions.get("suggestions")
-        and sum(s.get("ep_gain_window", 0.0) for s in suggestions["suggestions"])
-        >= 12.0
-    ):
-        return "Consider Wildcard this week to capture fixture swing (projected gain >= 12 over 4 GWs)."
-    return "No chip recommended by heuristics."
+    # Delegate to modular chip heuristics
+    return sp_chips.chip_heuristics(gw, suggestions, free_transfers)
 
 
 def main():
@@ -812,6 +541,30 @@ def main():
         default=os.path.join(os.path.dirname(__file__), "season_outputs"),
         help="Directory for per-GW outputs",
     )
+    ap.add_argument(
+        "--opponent-split",
+        action="store_true",
+        help="Use opponent-split EP adjustments (attack vs defence).",
+    )
+    ap.add_argument(
+        "--afcon-player-ids",
+        help="Comma-separated list of player ids away at AFCON (GW17-22).",
+    )
+    ap.add_argument(
+        "--afcon-gws",
+        default="17-22",
+        help="GW list or ranges where AFCON players are unavailable (e.g., 17-22).",
+    )
+    ap.add_argument(
+        "--pre-reset-downweight-gws",
+        default="15",
+        help="GW list or ranges to slightly downweight AFCON players before reset (e.g., 15).",
+    )
+    ap.add_argument(
+        "--allow-two-move",
+        action="store_true",
+        help="Enable simple 2-move bundle search for transfers.",
+    )
     args = ap.parse_args()
 
     bs, fixtures, mgw, _praw = load_sources(args)
@@ -821,7 +574,18 @@ def main():
         )
     players = add_player_features(bs, mgw)
 
-    ep_by_gw = ep_per_gw(players, fixtures, gw_range=range(1, 39))
+    afcon_ids = _parse_id_list(getattr(args, "afcon_player_ids", None))
+    afcon_weeks = _parse_gw_list(getattr(args, "afcon_gws", None))
+    pre_weeks = _parse_gw_list(getattr(args, "pre_reset_downweight_gws", None))
+    ep_by_gw = sp_ep.ep_per_gw(
+        players,
+        fixtures,
+        gw_range=range(1, 39),
+        opponent_split=bool(args.opponent_split),
+        afcon_player_ids=afcon_ids,
+        afcon_gws=afcon_weeks,
+        pre_reset_downweight_gws=pre_weeks,
+    )
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -836,12 +600,12 @@ def main():
         )
 
         # Captain shortlist
-        caps = captain_shortlist(
+        caps = sp_captain.captain_shortlist(
             ep_by_gw, players, gw, risk_mode=args.risk_mode, top_k=5
         )
 
         # Transfer suggestions (evaluated from this GW over horizon)
-        transfers = propose_transfers(
+        transfers = sp_transfers.propose_transfers(
             players=players,
             ep_by_gw=ep_by_gw,
             current_squad_ids=current_squad_ids,
@@ -851,10 +615,11 @@ def main():
             free_transfers=int(
                 args.free_transfers if gw != 16 else max(args.free_transfers, 5)
             ),
+            allow_two_move=bool(args.allow_two_move),
         )
 
         # Chip heuristics
-        chip_note = chip_heuristics(gw, transfers, int(args.free_transfers))
+        chip_note = sp_chips.chip_heuristics(gw, transfers, int(args.free_transfers))
 
         # Per-GW JSON plan
         plan = {
