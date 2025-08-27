@@ -26,11 +26,19 @@ def load_bootstrap_static(bootstrap_path: Optional[str], bootstrap_url: Optional
     raise FileNotFoundError("Provide --bootstrap (local file) or --bootstrap-url")
 
 def load_csv(path: Optional[str], url: Optional[str]) -> pd.DataFrame:
-    if path:
-        return pd.read_csv(path)
-    if url:
-        return pd.read_csv(url)
-    raise FileNotFoundError("Provide either a local path or a URL for the CSV")
+    src = path or url
+    if not src:
+        raise FileNotFoundError("Provide either a local path or a URL for the CSV")
+    # First attempt: default engine (fast C parser)
+    try:
+        return pd.read_csv(src)
+    except Exception:
+        # Fallback: more tolerant parser, skip malformed lines
+        try:
+            return pd.read_csv(src, engine="python", on_bad_lines="skip")
+        except TypeError:
+            # Older pandas without on_bad_lines
+            return pd.read_csv(src, engine="python")
 
 def element_type_to_pos(et: int) -> str:
     return {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}.get(int(et), "UNK")
@@ -135,7 +143,7 @@ def availability_penalty(status, chance) -> float:
     return penalty
 
 def score_row(row: pd.Series) -> float:
-    ep_next = safe = 0.0
+    ep_next = 0.0
     ep_next = safe_float(row.get("ep_next"))
     form_boot = safe_float(row.get("form"))
     ict = safe_float(row.get("ict_index"))
