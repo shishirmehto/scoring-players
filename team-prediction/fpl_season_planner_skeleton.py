@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-# (See previous message for full header docstring)
+"""Season planner and helper utilities for Fantasy Premier League (FPL).
+
+Generates per–gameweek outputs:
+- Top-5 players by position
+- Captain shortlists (protect/chase modes)
+- Greedy transfer suggestions over a horizon
+
+Data can be loaded from local Vaastav CSVs or the live FPL API with fallbacks.
+Sections and docstrings are provided to keep the module readable.
+"""
 
 import argparse, os, json
 import re
@@ -16,6 +25,16 @@ except Exception:
 
 
 def _load_json(path: Optional[str], url: Optional[str] = None):
+    """Load JSON from a local path if present; otherwise from the provided URL.
+
+    Args:
+        path: Local filesystem path to a JSON file.
+        url: HTTP(S) URL to fetch JSON if local path is not provided.
+
+    Raises:
+        RuntimeError: If a URL is provided but the HTTP client is unavailable.
+        FileNotFoundError: If neither a path nor a URL is provided.
+    """
     if path and os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -29,6 +48,7 @@ def _load_json(path: Optional[str], url: Optional[str] = None):
 
 
 def _load_csv(path: Optional[str], url: Optional[str] = None) -> pd.DataFrame:
+    """Load CSV from local path or URL with tolerant parsing fallbacks."""
     src = path or url
     if not src:
         raise FileNotFoundError("Provide a local path or a URL")
@@ -65,7 +85,8 @@ def _latest_available_season(data_root: str) -> Optional[str]:
         candidates = [
             name
             for name in os.listdir(data_root)
-            if re.fullmatch(r"\d{4}-\d{2}", name) and os.path.isdir(os.path.join(data_root, name))
+            if re.fullmatch(r"\d{4}-\d{2}", name)
+            and os.path.isdir(os.path.join(data_root, name))
         ]
         if not candidates:
             return None
@@ -82,6 +103,9 @@ def _season_paths(data_root: str, season: str) -> Dict[str, str]:
     }
 
 
+# ===== Data acquisition and resolution =====
+
+
 def load_sources(args):
     """Load bootstrap, fixtures, merged_gw and players_raw using args and Vaastav helpers.
 
@@ -92,7 +116,9 @@ def load_sources(args):
       If not found and --allow-remote, fall back to GitHub raw URLs
     """
     # Attempt to import Vaastav getters even though the directory has a hyphen
-    getters_path = os.path.join(os.path.dirname(__file__), "Fantasy-Premier-League", "getters.py")
+    getters_path = os.path.join(
+        os.path.dirname(__file__), "Fantasy-Premier-League", "getters.py"
+    )
     vaastav_getters = _import_module_from_path("fpl_getters", getters_path)
 
     # Bootstrap
@@ -103,7 +129,9 @@ def load_sources(args):
             bs = vaastav_getters.get_data()  # type: ignore[attr-defined]
         else:
             # fall back to default URL if requests available
-            bs = _load_json(None, "https://fantasy.premierleague.com/api/bootstrap-static/")
+            bs = _load_json(
+                None, "https://fantasy.premierleague.com/api/bootstrap-static/"
+            )
 
     # Fixtures
     if args.fixtures or args.fixtures_url:
@@ -112,7 +140,9 @@ def load_sources(args):
         if vaastav_getters and hasattr(vaastav_getters, "get_fixtures_data"):
             fixtures = vaastav_getters.get_fixtures_data()  # type: ignore[attr-defined]
         else:
-            fixtures = _load_json(None, "https://fantasy.premierleague.com/api/fixtures/")
+            fixtures = _load_json(
+                None, "https://fantasy.premierleague.com/api/fixtures/"
+            )
 
     # Resolve season file paths for merged_gw and players_raw
     data_root = args.fpl_data_root or _default_fpl_data_root()
@@ -130,7 +160,9 @@ def load_sources(args):
         mgw_url = f"https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/{season}/gws/merged_gw.csv"
         mgw = _load_csv(None, mgw_url)
     else:
-        raise FileNotFoundError("merged_gw.csv not found. Pass --merged-gw or --merged-gw-url or set --season/--fpl-data-root.")
+        raise FileNotFoundError(
+            "merged_gw.csv not found. Pass --merged-gw or --merged-gw-url or set --season/--fpl-data-root."
+        )
 
     # players_raw.csv
     praw_path_or_url = args.players_raw or season_paths.get("players_raw")
@@ -143,7 +175,9 @@ def load_sources(args):
         praw_url = f"https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/{season}/players_raw.csv"
         praw = _load_csv(None, praw_url)
     else:
-        raise FileNotFoundError("players_raw.csv not found. Pass --players-raw or --players-raw-url or set --season/--fpl-data-root.")
+        raise FileNotFoundError(
+            "players_raw.csv not found. Pass --players-raw or --players-raw-url or set --season/--fpl-data-root."
+        )
 
     return bs, fixtures, mgw, praw
 
@@ -187,6 +221,12 @@ def _saves_per90_last4(df_last4: pd.DataFrame) -> float:
 
 
 def add_player_features(bootstrap: dict, merged_gw: pd.DataFrame) -> pd.DataFrame:
+    """Return player DataFrame enriched with short-horizon form features.
+
+    Computes features from last four appearances in merged_gw (form4, ict4,
+    mins60, returns4, cs4, saves90_4), normalizes numeric fields, and derives
+    `position` and `price`.
+    """
     elements = pd.DataFrame(bootstrap["elements"])
     teams = pd.DataFrame(bootstrap["teams"])[["id", "name"]].rename(
         columns={"id": "team_id", "name": "team_name"}
@@ -244,6 +284,7 @@ def add_player_features(bootstrap: dict, merged_gw: pd.DataFrame) -> pd.DataFram
 
 
 def availability_penalty(status, chance) -> float:
+    """Heuristic penalty for availability based on `status` and `chance`."""
     pen = 0.0
     if status in ("i", "s"):
         pen += 1.0
@@ -261,6 +302,10 @@ def availability_penalty(status, chance) -> float:
 
 
 def _build_team_fixture_index(fixtures_json: dict) -> dict:
+    """Map team->event to opponent and difficulty (legacy helper).
+
+    Most logic now uses the vectorized DataFrame from `_fixture_difficulty_df`.
+    """
     fx = pd.DataFrame(fixtures_json)
     fx = fx[
         ["event", "team_h", "team_a", "team_h_difficulty", "team_a_difficulty"]
@@ -283,11 +328,19 @@ def _fixture_difficulty_df(fixtures_json: dict) -> pd.DataFrame:
     """Return a DataFrame mapping team_id x event -> difficulty."""
     fx = pd.DataFrame(fixtures_json)
     if fx.empty:
-        return pd.DataFrame(columns=["event", "team_id", "diff"]).astype({"event": int, "team_id": int, "diff": float})
-    fx = fx[["event", "team_h", "team_a", "team_h_difficulty", "team_a_difficulty"]].dropna()
+        return pd.DataFrame(columns=["event", "team_id", "diff"]).astype(
+            {"event": int, "team_id": int, "diff": float}
+        )
+    fx = fx[
+        ["event", "team_h", "team_a", "team_h_difficulty", "team_a_difficulty"]
+    ].dropna()
     fx["event"] = fx["event"].astype(int)
-    home = fx[["event", "team_h", "team_h_difficulty"]].rename(columns={"team_h": "team_id", "team_h_difficulty": "diff"})
-    away = fx[["event", "team_a", "team_a_difficulty"]].rename(columns={"team_a": "team_id", "team_a_difficulty": "diff"})
+    home = fx[["event", "team_h", "team_h_difficulty"]].rename(
+        columns={"team_h": "team_id", "team_h_difficulty": "diff"}
+    )
+    away = fx[["event", "team_a", "team_a_difficulty"]].rename(
+        columns={"team_a": "team_id", "team_a_difficulty": "diff"}
+    )
     out = pd.concat([home, away], ignore_index=True)
     out["team_id"] = out["team_id"].astype(int)
     out["diff"] = pd.to_numeric(out["diff"], errors="coerce").fillna(3.0)
@@ -330,28 +383,52 @@ def ep_per_gw(df_players: pd.DataFrame, fixtures_json: dict, gw_range=range(1, 3
     fixt_df = _fixture_difficulty_df(fixtures_json)
     out: Dict[int, pd.DataFrame] = {}
     if df_players.empty or fixt_df.empty:
-        return {gw: pd.DataFrame(columns=["id", "web_name", "team_id", "team_name", "position", "price", "ep"]) for gw in gw_range}
+        return {
+            gw: pd.DataFrame(
+                columns=[
+                    "id",
+                    "web_name",
+                    "team_id",
+                    "team_name",
+                    "position",
+                    "price",
+                    "ep",
+                ]
+            )
+            for gw in gw_range
+        }
 
     # Pre-compute reusable series
     base_series = (
         0.55 * pd.to_numeric(df_players.get("form", 0), errors="coerce").fillna(0.0)
         + 0.25 * pd.to_numeric(df_players.get("form4", 0), errors="coerce").fillna(0.0)
-        + 0.15 * (pd.to_numeric(df_players.get("ict_index", 0), errors="coerce").fillna(0.0) / 10.0)
-        + 0.05 * (pd.to_numeric(df_players.get("ict4", 0), errors="coerce").fillna(0.0) / 10.0)
+        + 0.15
+        * (
+            pd.to_numeric(df_players.get("ict_index", 0), errors="coerce").fillna(0.0)
+            / 10.0
+        )
+        + 0.05
+        * (pd.to_numeric(df_players.get("ict4", 0), errors="coerce").fillna(0.0) / 10.0)
     )
 
     mins60 = pd.to_numeric(df_players.get("mins60", 0.5), errors="coerce").fillna(0.5)
     xmins_series = 35.0 + 55.0 * mins60
 
     cs4 = pd.to_numeric(df_players.get("cs4", 0.0), errors="coerce").fillna(0.0)
-    saves90_4 = pd.to_numeric(df_players.get("saves90_4", 0.0), errors="coerce").fillna(0.0)
-    returns4 = pd.to_numeric(df_players.get("returns4", 0.0), errors="coerce").fillna(0.0)
+    saves90_4 = pd.to_numeric(df_players.get("saves90_4", 0.0), errors="coerce").fillna(
+        0.0
+    )
+    returns4 = pd.to_numeric(df_players.get("returns4", 0.0), errors="coerce").fillna(
+        0.0
+    )
     position = df_players["position"].astype(str)
 
     pos_boost = pd.Series(0.0, index=df_players.index)
     # GK
     is_gk = position == "GK"
-    pos_boost.loc[is_gk] = 0.25 * cs4.loc[is_gk] + 0.10 * np.minimum(saves90_4.loc[is_gk] / 5.0, 1.0)
+    pos_boost.loc[is_gk] = 0.25 * cs4.loc[is_gk] + 0.10 * np.minimum(
+        saves90_4.loc[is_gk] / 5.0, 1.0
+    )
     # DEF
     is_def = position == "DEF"
     pos_boost.loc[is_def] = 0.30 * cs4.loc[is_def]
@@ -363,41 +440,67 @@ def ep_per_gw(df_players: pd.DataFrame, fixtures_json: dict, gw_range=range(1, 3
     pos_boost.loc[is_fwd] = 0.20 * returns4.loc[is_fwd]
 
     # Availability penalty vectorized
-    status_pen = df_players.get("status", pd.Series(index=df_players.index, dtype=object)).map({"i": 1.0, "s": 1.0, "d": 0.3}).fillna(0.0)
-    chance = pd.to_numeric(df_players.get("chance_of_playing_next_round", 100), errors="coerce").fillna(100.0)
+    status_pen = (
+        df_players.get("status", pd.Series(index=df_players.index, dtype=object))
+        .map({"i": 1.0, "s": 1.0, "d": 0.3})
+        .fillna(0.0)
+    )
+    chance = pd.to_numeric(
+        df_players.get("chance_of_playing_next_round", 100), errors="coerce"
+    ).fillna(100.0)
     chance_pen = np.where(chance < 75.0, 0.4, np.where(chance < 100.0, 0.1, 0.0))
     avail_pen = status_pen + chance_pen
 
-    base_inputs = pd.DataFrame({
-        "id": df_players["id"].astype(int),
-        "web_name": df_players["web_name"],
-        "team": pd.to_numeric(df_players["team"], errors="coerce").fillna(0).astype(int),
-        "team_name": df_players["team_name"],
-        "position": position,
-        "price": pd.to_numeric(df_players["price"], errors="coerce").fillna(0.0),
-        "xmins": xmins_series,
-        "base": base_series,
-        "pos_boost": pos_boost,
-        "avail_pen": avail_pen,
-    })
+    base_inputs = pd.DataFrame(
+        {
+            "id": df_players["id"].astype(int),
+            "web_name": df_players["web_name"],
+            "team": pd.to_numeric(df_players["team"], errors="coerce")
+            .fillna(0)
+            .astype(int),
+            "team_name": df_players["team_name"],
+            "position": position,
+            "price": pd.to_numeric(df_players["price"], errors="coerce").fillna(0.0),
+            "xmins": xmins_series,
+            "base": base_series,
+            "pos_boost": pos_boost,
+            "avail_pen": avail_pen,
+        }
+    )
 
     for gw in gw_range:
         fi = fixt_df[fixt_df["event"] == int(gw)][["team_id", "diff"]]
         if fi.empty:
-            out[gw] = pd.DataFrame(columns=["id", "web_name", "team_id", "team_name", "position", "price", "ep"])
+            out[gw] = pd.DataFrame(
+                columns=[
+                    "id",
+                    "web_name",
+                    "team_id",
+                    "team_name",
+                    "position",
+                    "price",
+                    "ep",
+                ]
+            )
             continue
         df = base_inputs.merge(fi, left_on="team", right_on="team_id", how="inner")
-        fixture_adj = 1.0 + (3.0 - pd.to_numeric(df["diff"], errors="coerce").fillna(3.0)) * 0.06
-        ep = (df["xmins"] / 90.0) * df["base"] * fixture_adj * (1.0 + df["pos_boost"]) - df["avail_pen"]
-        df_out = pd.DataFrame({
-            "id": df["id"].astype(int),
-            "web_name": df["web_name"],
-            "team_id": df["team_id"].astype(int),
-            "team_name": df["team_name"],
-            "position": df["position"],
-            "price": df["price"],
-            "ep": ep.clip(lower=0.0),
-        })
+        fixture_adj = (
+            1.0 + (3.0 - pd.to_numeric(df["diff"], errors="coerce").fillna(3.0)) * 0.06
+        )
+        ep = (df["xmins"] / 90.0) * df["base"] * fixture_adj * (
+            1.0 + df["pos_boost"]
+        ) - df["avail_pen"]
+        df_out = pd.DataFrame(
+            {
+                "id": df["id"].astype(int),
+                "web_name": df["web_name"],
+                "team_id": df["team_id"].astype(int),
+                "team_name": df["team_name"],
+                "position": df["position"],
+                "price": df["price"],
+                "ep": ep.clip(lower=0.0),
+            }
+        )
         out[gw] = df_out
     return out
 
@@ -416,6 +519,10 @@ def captain_shortlist(
     risk_mode: str = "protect",
     top_k: int = 5,
 ) -> pd.DataFrame:
+    """Shortlist captain candidates for `gw` with ownership leverage.
+
+    Protect mode mildly penalizes low-owned picks; chase mode rewards them.
+    """
     df = ep_by_gw.get(gw, pd.DataFrame()).copy()
     if df.empty:
         return df
@@ -434,7 +541,32 @@ def captain_shortlist(
     ]
 
 
+# ===== Transfer planning helpers =====
+
+
+def _build_ep_window(
+    ep_by_gw: Dict[int, pd.DataFrame], window: List[int]
+) -> pd.DataFrame:
+    """Build cumulative expected points for each player across a GW window.
+
+    Returns a DataFrame with columns [id, ep_window].
+    """
+    ep_sum: Optional[pd.DataFrame] = None
+    for gw in window:
+        df = ep_by_gw.get(gw, pd.DataFrame())[["id", "ep"]].rename(
+            columns={"ep": f"ep_{gw}"}
+        )
+        ep_sum = df if ep_sum is None else ep_sum.merge(df, on="id", how="outer")
+    if ep_sum is None:
+        return pd.DataFrame(columns=["id", "ep_window"])  # type: ignore[return-value]
+    ep_sum = ep_sum.fillna(0.0)
+    ep_cols = [c for c in ep_sum.columns if c.startswith("ep_")]
+    ep_sum["ep_window"] = ep_sum[ep_cols].sum(axis=1)
+    return ep_sum[["id", "ep_window"]]
+
+
 def _load_current_squad(path: Optional[str], df_players: pd.DataFrame) -> List[int]:
+    """Load up to 15 player ids from CSV with either `id` or `web_name` column."""
     if not path or not os.path.exists(path):
         return []
     try:
@@ -460,6 +592,7 @@ def _load_current_squad(path: Optional[str], df_players: pd.DataFrame) -> List[i
 def _best_xi_ep_for_squad(
     squad_ids: List[int], ep_df: pd.DataFrame
 ) -> Tuple[float, List[int]]:
+    """Select a viable XI under position minimums and return (total_ep, xi_ids)."""
     if not squad_ids:
         return 0.0, []
     team = ep_df[ep_df["id"].isin(squad_ids)].copy()
@@ -491,6 +624,7 @@ def _best_xi_ep_for_squad(
 
 
 def _squad_team_counts(squad_ids: List[int], players: pd.DataFrame) -> Dict[str, int]:
+    """Count players per real team within a squad."""
     counts: Dict[str, int] = {}
     sub = players[players["id"].isin(squad_ids)]
     for tm in sub["team_name"].dropna().tolist():
@@ -507,23 +641,19 @@ def propose_transfers(
     bank: float,
     free_transfers: int,
 ) -> Dict[str, object]:
+    """Suggest up to `free_transfers` greedy upgrades over a `horizon` of GWs.
+
+    Replaces the lowest-EP-window XI member with the best affordable upgrade
+    that respects the 3-per-team constraint.
+    """
     if not current_squad_ids or free_transfers <= 0:
         return {"suggestions": [], "notes": "No squad provided or 0 FTs"}
     # Build horizon EP per player (sum over gw window)
     window = [gw for gw in range(gw_start, gw_start + horizon) if gw in ep_by_gw]
     if not window:
         return {"suggestions": [], "notes": "No EP window available"}
-    ep_sum = None
-    for gw in window:
-        df = ep_by_gw[gw][["id", "ep"]].rename(columns={"ep": f"ep_{gw}"})
-        ep_sum = df if ep_sum is None else ep_sum.merge(df, on="id", how="outer")
-    ep_sum = ep_sum.fillna(0.0)
-    ep_sum["ep_window"] = ep_sum[
-        [c for c in ep_sum.columns if c.startswith("ep_")]
-    ].sum(axis=1)
-    pool = players.merge(ep_sum[["id", "ep_window"]], on="id", how="left").fillna(
-        {"ep_window": 0.0}
-    )
+    ep_sum = _build_ep_window(ep_by_gw, window)
+    pool = players.merge(ep_sum, on="id", how="left").fillna({"ep_window": 0.0})
 
     # Current XI for first GW in window
     first_gw = window[0]
@@ -532,7 +662,7 @@ def propose_transfers(
     if not current_xi_ids:
         return {"suggestions": [], "notes": "Could not form XI from provided squad"}
 
-    # Greedy suggest up to free_transfers swaps: replace lowest ep_window XI member with best upgrade within bank and 3-per-team rule
+    # Greedy loop: replace lowest ep_window XI member with the best affordable upgrade
     suggestions = []
     squad_ids = current_squad_ids.copy()
     team_counts = _squad_team_counts(squad_ids, players)
@@ -619,6 +749,7 @@ def propose_transfers(
 def chip_heuristics(
     gw: int, suggestions: Dict[str, object], free_transfers: int
 ) -> str:
+    """Light-touch chip suggestion based on GW and projected gains."""
     # Simple placeholders aligned with the brief; adapt in-season with BGW/DGW detection
     if gw == 16:
         return (
@@ -636,6 +767,7 @@ def chip_heuristics(
 
 
 def main():
+    """CLI entrypoint: loads sources, computes outputs, writes per-GW files."""
     ap = argparse.ArgumentParser()
     ap.add_argument("--bootstrap", help="local bootstrap-static.json")
     ap.add_argument(

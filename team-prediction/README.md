@@ -3,8 +3,8 @@
 A holistic, data-driven season planning workflow that fuses the official FPL API with the vaastav historical dataset to project Expected Points (EP) per player for each Gameweek, manage risk via ownership-aware decisions, and schedule chips intelligently.
 
 ## What this folder contains
-- `fpl_season_planner_skeleton.py`: per-GW Top-5 generator using EP heuristics and fixtures.
-- `season_outputs/`: per-GW CSVs of Top-5 players by position (GK/DEF/MID/FWD).
+- `fpl_season_planner_skeleton.py`: per-GW Top-5 generator with captain shortlist, transfer suggestions, chip heuristics, and a per-GW JSON plan.
+- `season_outputs/`: per-GW CSVs of Top-5 players by position (GK/DEF/MID/FWD) and per-GW JSON plans (`gw_XX_plan.json`).
 
 ## How to run
 ```bash
@@ -16,17 +16,34 @@ python team-prediction/fpl_season_planner_skeleton.py \
   --bootstrap path/to/bootstrap-static.json \
   --fixtures path/to/fixtures.json \
   --merged-gw path/to/merged_gw.csv \
-  --players-raw path/to/players_raw.csv
+  --players-raw path/to/players_raw.csv \
+  --risk-mode protect \
+  --horizon 4 \
+  --current-squad path/to/current_squad.csv \
+  --bank 1.5 \
+  --free-transfers 1 \
+  --output-dir team-prediction/season_outputs
 
 # Or with live URLs (API + hosted CSVs)
 python team-prediction/fpl_season_planner_skeleton.py \
   --bootstrap-url https://fantasy.premierleague.com/api/bootstrap-static/ \
   --fixtures-url https://fantasy.premierleague.com/api/fixtures/ \
   --merged-gw https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/2025-26/gws/merged_gw.csv \
-  --players-raw https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/2025-26/players_raw.csv
+  --players-raw https://raw.githubusercontent.com/vaastav/Fantasy-Premier-League/master/data/2025-26/players_raw.csv \
+  --risk-mode chase \
+  --horizon 6 \
+  --bank 0.5 \
+  --free-transfers 2
 ```
 
-Outputs are written to `team-prediction/season_outputs/gw_XX_top5_by_pos.csv`.
+Outputs are written to `team-prediction/season_outputs/` by default and include:
+
+- `gw_XX_top5_by_pos.csv`: Top-5 per position (GK/DEF/MID/FWD) by EP for that GW.
+- `gw_XX_plan.json`: compact per-GW plan containing:
+  - `top5_by_pos`: the Top-5 lists embedded as JSON
+  - `captain_shortlist`: EP×ownership-adjusted captain candidates (respecting `--risk-mode`)
+  - `transfer_suggestions`: greedy 0–FT to N–FT suggestions across the `--horizon` window, with EP gains and bank tracking
+  - `chip_suggestion`: lightweight heuristic note (e.g., GW16 AFCON top-up, early Wildcard window)
 
 ---
 
