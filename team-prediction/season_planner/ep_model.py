@@ -14,6 +14,13 @@ from typing import Dict, Iterable, List, Optional, Set
 import numpy as np
 import pandas as pd
 
+try:
+    # Optional import; used when --use-match-model is enabled
+    from .match_model import team_strengths_from_mgw, predict_fixtures
+except Exception:  # pragma: no cover
+    team_strengths_from_mgw = None  # type: ignore
+    predict_fixtures = None  # type: ignore
+
 
 def _fixture_difficulty_df(fixtures_json: dict) -> pd.DataFrame:
     fx = pd.DataFrame(fixtures_json)
@@ -97,6 +104,8 @@ def ep_per_gw(
     gw_range: Iterable[int] = range(1, 39),
     *,
     opponent_split: bool = True,
+    use_match_model: bool = False,
+    merged_gw: Optional[pd.DataFrame] = None,
     afcon_player_ids: Optional[Set[int]] = None,
     afcon_gws: Optional[Iterable[int]] = None,
     pre_reset_downweight_gws: Optional[Iterable[int]] = None,
@@ -110,7 +119,11 @@ def ep_per_gw(
     - pre_reset_downweight_gws: downweight AFCON players slightly in weeks
       leading up to the reset (e.g., GW15->GW16).
     """
-    fixt_df = _fixture_difficulty_df(fixtures_json)
+    if use_match_model and team_strengths_from_mgw is not None and predict_fixtures is not None and merged_gw is not None:
+        strengths = team_strengths_from_mgw(merged_gw)
+        fixt_df = predict_fixtures(fixtures_json, strengths)[["event", "team_id", "cs_prob", "lambda_for", "lambda_against"]]
+    else:
+        fixt_df = _fixture_difficulty_df(fixtures_json)
     out: Dict[int, pd.DataFrame] = {}
     if df_players.empty or fixt_df.empty:
         return {
@@ -159,20 +172,33 @@ def ep_per_gw(
     pre_weeks = set(pre_reset_downweight_gws or set())
 
     for gw in gw_range:
-        fi = fixt_df[fixt_df["event"] == int(gw)][["team_id", "diff"]]
+        if use_match_model and {"cs_prob", "lambda_for", "lambda_against"}.issubset(set(fixt_df.columns)):
+            fi = fixt_df[fixt_df["event"] == int(gw)][["team_id", "cs_prob", "lambda_for", "lambda_against"]]
+        else:
+            fi = fixt_df[fixt_df["event"] == int(gw)][["team_id", "diff"]]
         if fi.empty:
             out[gw] = pd.DataFrame(columns=["id", "web_name", "team_id", "team_name", "position", "price", "ep"])  # type: ignore[assignment]
             continue
         df = base_inputs.merge(fi, left_on="team", right_on="team_id", how="inner")
-        diff = pd.to_numeric(df["diff"], errors="coerce").fillna(3.0)
-        if opponent_split:
-            # Stronger for attackers, milder for defenders
-            att_adj = (1.0 + (3.0 - diff) * 0.08).clip(lower=0.85, upper=1.15)
-            def_adj = (1.0 + (3.0 - diff) * 0.05).clip(lower=0.90, upper=1.12)
+        if use_match_model and "cs_prob" in df.columns:
+            # Build position-specific adjustments from match model rates
+            # Attackers: scale by team lambda_for; Def/GK: scale by cs_prob and inverse of lambda_against
+            lam_for = pd.to_numeric(df.get("lambda_for", 1.3), errors="coerce").fillna(1.3)
+            lam_against = pd.to_numeric(df.get("lambda_against", 1.3), errors="coerce").fillna(1.3)
+            cs_prob = pd.to_numeric(df.get("cs_prob", 0.3), errors="coerce").fillna(0.3)
             is_att = df["position"].isin(["MID", "FWD"])
+            att_adj = (0.85 + 0.12 * (lam_for / 1.35)).clip(lower=0.85, upper=1.15)
+            def_adj = (0.90 + 0.15 * cs_prob).clip(lower=0.90, upper=1.12)
             fixture_adj = np.where(is_att, att_adj, def_adj)
         else:
-            fixture_adj = (1.0 + (3.0 - diff) * 0.06).clip(lower=0.88, upper=1.14)
+            diff = pd.to_numeric(df["diff"], errors="coerce").fillna(3.0)
+            if opponent_split:
+                att_adj = (1.0 + (3.0 - diff) * 0.08).clip(lower=0.85, upper=1.15)
+                def_adj = (1.0 + (3.0 - diff) * 0.05).clip(lower=0.90, upper=1.12)
+                is_att = df["position"].isin(["MID", "FWD"])
+                fixture_adj = np.where(is_att, att_adj, def_adj)
+            else:
+                fixture_adj = (1.0 + (3.0 - diff) * 0.06).clip(lower=0.88, upper=1.14)
 
         ep = (df["xmins"] / 90.0) * df["base"] * fixture_adj * (
             1.0 + df["pos_boost"]

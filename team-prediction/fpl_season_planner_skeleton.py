@@ -565,6 +565,11 @@ def main():
         action="store_true",
         help="Enable simple 2-move bundle search for transfers.",
     )
+    ap.add_argument(
+        "--use-match-model",
+        action="store_true",
+        help="Use per-match goal/CS model (decayed team strengths) for EP.",
+    )
     args = ap.parse_args()
 
     bs, fixtures, mgw, _praw = load_sources(args)
@@ -582,6 +587,8 @@ def main():
         fixtures,
         gw_range=range(1, 39),
         opponent_split=bool(args.opponent_split),
+        use_match_model=bool(args.use_match_model),
+        merged_gw=mgw if bool(args.use_match_model) else None,
         afcon_player_ids=afcon_ids,
         afcon_gws=afcon_weeks,
         pre_reset_downweight_gws=pre_weeks,
