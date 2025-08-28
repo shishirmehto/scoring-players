@@ -28,7 +28,9 @@ def _exp_decay_weights(round_series: pd.Series, half_life_gw: float = 8.0) -> pd
     return decay
 
 
-def _poisson_grid_probs(lam_h: float, lam_a: float, max_goals: int = 8) -> Tuple[float, float, float]:
+def _poisson_grid_probs(
+    lam_h: float, lam_a: float, max_goals: int = 8
+) -> Tuple[float, float, float]:
     """Return (p_home_win, p_draw, p_away_win) by summing Poisson grid up to max_goals."""
     g = np.arange(0, max_goals + 1)
     # Poisson PMFs
@@ -62,23 +64,15 @@ def team_strengths_from_mgw(
     df = df.dropna(subset=["round"])  # ensure rounds present
     df["w"] = _exp_decay_weights(df["round"], half_life_gw=half_life_gw)
 
-    # Weighted team metrics
-    g = df.groupby("team")
-    att = g.apply(
-        lambda x: np.average(
-            pd.to_numeric(x["goals_scored"], errors="coerce").fillna(0.0),
-            weights=x["w"],
-        )
-    ).rename("att_raw")
-    dfn = g.apply(
-        lambda x: np.average(
-            pd.to_numeric(x["goals_conceded"], errors="coerce").fillna(0.0),
-            weights=x["w"],
-        )
-    ).rename("def_raw")
-    out = (
-        pd.concat([att, dfn], axis=1).reset_index().rename(columns={"team": "team_id"})
-    )
+    # Weighted team metrics without groupby.apply (avoids FutureWarning)
+    team = df["team"]
+    w = df["w"]
+    gs = pd.to_numeric(df["goals_scored"], errors="coerce").fillna(0.0)
+    gc = pd.to_numeric(df["goals_conceded"], errors="coerce").fillna(0.0)
+    w_sum = w.groupby(team).sum()
+    att = (gs.mul(w)).groupby(team).sum().div(w_sum).rename("att_raw")
+    dfn = (gc.mul(w)).groupby(team).sum().div(w_sum).rename("def_raw")
+    out = pd.concat([att, dfn], axis=1).reset_index().rename(columns={"team": "team_id"})
 
     # Normalize by league averages
     league_att = float(out["att_raw"].mean()) if not out.empty else 1.3
