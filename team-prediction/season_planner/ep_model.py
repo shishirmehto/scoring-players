@@ -119,9 +119,17 @@ def ep_per_gw(
     - pre_reset_downweight_gws: downweight AFCON players slightly in weeks
       leading up to the reset (e.g., GW15->GW16).
     """
-    if use_match_model and team_strengths_from_mgw is not None and predict_fixtures is not None and merged_gw is not None:
+    if (
+        use_match_model
+        and team_strengths_from_mgw is not None
+        and predict_fixtures is not None
+        and merged_gw is not None
+    ):
         strengths = team_strengths_from_mgw(merged_gw)
-        fixt_df = predict_fixtures(fixtures_json, strengths)[["event", "team_id", "cs_prob", "lambda_for", "lambda_against"]]
+        fixt_df = predict_fixtures(fixtures_json, strengths)
+        # If prediction output missing expected columns, fall back to difficulty
+        if not isinstance(fixt_df, pd.DataFrame) or not {"event", "team_id"}.issubset(set(fixt_df.columns)):
+            fixt_df = _fixture_difficulty_df(fixtures_json)
     else:
         fixt_df = _fixture_difficulty_df(fixtures_json)
     out: Dict[int, pd.DataFrame] = {}
@@ -172,8 +180,12 @@ def ep_per_gw(
     pre_weeks = set(pre_reset_downweight_gws or set())
 
     for gw in gw_range:
-        if use_match_model and {"cs_prob", "lambda_for", "lambda_against"}.issubset(set(fixt_df.columns)):
-            fi = fixt_df[fixt_df["event"] == int(gw)][["team_id", "cs_prob", "lambda_for", "lambda_against"]]
+        if use_match_model and {"cs_prob", "lambda_for", "lambda_against"}.issubset(
+            set(fixt_df.columns)
+        ):
+            fi = fixt_df[fixt_df["event"] == int(gw)][
+                ["team_id", "cs_prob", "lambda_for", "lambda_against"]
+            ]
         else:
             fi = fixt_df[fixt_df["event"] == int(gw)][["team_id", "diff"]]
         if fi.empty:
@@ -183,8 +195,12 @@ def ep_per_gw(
         if use_match_model and "cs_prob" in df.columns:
             # Build position-specific adjustments from match model rates
             # Attackers: scale by team lambda_for; Def/GK: scale by cs_prob and inverse of lambda_against
-            lam_for = pd.to_numeric(df.get("lambda_for", 1.3), errors="coerce").fillna(1.3)
-            lam_against = pd.to_numeric(df.get("lambda_against", 1.3), errors="coerce").fillna(1.3)
+            lam_for = pd.to_numeric(df.get("lambda_for", 1.3), errors="coerce").fillna(
+                1.3
+            )
+            lam_against = pd.to_numeric(
+                df.get("lambda_against", 1.3), errors="coerce"
+            ).fillna(1.3)
             cs_prob = pd.to_numeric(df.get("cs_prob", 0.3), errors="coerce").fillna(0.3)
             is_att = df["position"].isin(["MID", "FWD"])
             att_adj = (0.85 + 0.12 * (lam_for / 1.35)).clip(lower=0.85, upper=1.15)
