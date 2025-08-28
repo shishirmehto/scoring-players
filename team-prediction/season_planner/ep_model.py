@@ -76,15 +76,16 @@ def _position_boost(df_players: pd.DataFrame) -> pd.Series:
 
     pos_boost = pd.Series(0.0, index=df_players.index)
     is_gk = position == "GK"
-    pos_boost.loc[is_gk] = 0.25 * cs4.loc[is_gk] + 0.10 * np.minimum(
+    # Reduced GK/DEF impact to curb defender-heavy captaincy
+    pos_boost.loc[is_gk] = 0.20 * cs4.loc[is_gk] + 0.08 * np.minimum(
         saves90_4.loc[is_gk] / 5.0, 1.0
     )
     is_def = position == "DEF"
-    pos_boost.loc[is_def] = 0.30 * cs4.loc[is_def]
+    pos_boost.loc[is_def] = 0.22 * cs4.loc[is_def]
     is_mid = position == "MID"
-    pos_boost.loc[is_mid] = 0.15 * returns4.loc[is_mid]
+    pos_boost.loc[is_mid] = 0.16 * returns4.loc[is_mid]
     is_fwd = position == "FWD"
-    pos_boost.loc[is_fwd] = 0.20 * returns4.loc[is_fwd]
+    pos_boost.loc[is_fwd] = 0.22 * returns4.loc[is_fwd]
     return pos_boost
 
 

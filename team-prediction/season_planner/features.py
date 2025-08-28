@@ -13,10 +13,10 @@ import pandas as pd
 import numpy as np
 
 
-def _minutes60_prob(df_last4: pd.DataFrame) -> float:
-    if len(df_last4) == 0 or "minutes" not in df_last4.columns:
+def _minutes60_prob_last_n(df_last_n: pd.DataFrame) -> float:
+    if len(df_last_n) == 0 or "minutes" not in df_last_n.columns:
         return 0.0
-    return (df_last4["minutes"] >= 60).mean()
+    return (df_last_n["minutes"] >= 60).mean()
 
 
 def _returns_rate_last4(df_last4: pd.DataFrame) -> float:
@@ -79,6 +79,7 @@ def add_player_features(bootstrap: dict, merged_gw: pd.DataFrame) -> pd.DataFram
     feats: List[dict] = []
     for pid, g in mgw.groupby("element"):
         g = g.sort_values("round")
+        last6 = g.tail(6)
         last4 = g.tail(4)
         feats.append(
             {
@@ -89,7 +90,11 @@ def add_player_features(bootstrap: dict, merged_gw: pd.DataFrame) -> pd.DataFram
                     else 0.0
                 ),
                 "ict4": _ict_last4(last4),
-                "mins60": _minutes60_prob(last4),
+                "mins60": (
+                    _minutes60_prob_last_n(last6)
+                    if len(last6) > 0 and "minutes" in last6.columns
+                    else _minutes60_prob_last_n(last4)
+                ),
                 "returns4": _returns_rate_last4(last4),
                 "cs4": _clean_sheet_rate(last4),
                 "saves90_4": _saves_per90_last4(last4),
