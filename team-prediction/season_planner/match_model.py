@@ -28,7 +28,25 @@ def _exp_decay_weights(round_series: pd.Series, half_life_gw: float = 8.0) -> pd
     return decay
 
 
-def team_strengths_from_mgw(mgw: pd.DataFrame, half_life_gw: float = 8.0) -> pd.DataFrame:
+def _poisson_grid_probs(lam_h: float, lam_a: float, max_goals: int = 8) -> Tuple[float, float, float]:
+    """Return (p_home_win, p_draw, p_away_win) by summing Poisson grid up to max_goals."""
+    g = np.arange(0, max_goals + 1)
+    # Poisson PMFs
+    fact = np.array([np.math.factorial(int(x)) for x in g], dtype=float)
+    ph = np.exp(-lam_h) * np.power(lam_h, g) / np.maximum(1.0, fact)
+    pa = np.exp(-lam_a) * np.power(lam_a, g) / np.maximum(1.0, fact)
+    grid = np.outer(ph, pa)
+    p_draw = float(np.sum(np.diag(grid)))
+    iu, ju = np.triu_indices_from(grid, k=1)
+    il, jl = np.tril_indices_from(grid, k=-1)
+    p_home = float(np.sum(grid[iu, ju]))
+    p_away = float(np.sum(grid[il, jl]))
+    return p_home, p_draw, p_away
+
+
+def team_strengths_from_mgw(
+    mgw: pd.DataFrame, half_life_gw: float = 8.0
+) -> pd.DataFrame:
     """Return DataFrame with columns [team_id, att_str, def_str].
 
     att_str ~ decayed average goals_scored; def_str ~ decayed average goals_conceded (lower is better).
@@ -46,11 +64,21 @@ def team_strengths_from_mgw(mgw: pd.DataFrame, half_life_gw: float = 8.0) -> pd.
 
     # Weighted team metrics
     g = df.groupby("team")
-    att = (g.apply(lambda x: np.average(pd.to_numeric(x["goals_scored"], errors="coerce").fillna(0.0), weights=x["w"]))
-           .rename("att_raw"))
-    dfn = (g.apply(lambda x: np.average(pd.to_numeric(x["goals_conceded"], errors="coerce").fillna(0.0), weights=x["w"]))
-           .rename("def_raw"))
-    out = pd.concat([att, dfn], axis=1).reset_index().rename(columns={"team": "team_id"})
+    att = g.apply(
+        lambda x: np.average(
+            pd.to_numeric(x["goals_scored"], errors="coerce").fillna(0.0),
+            weights=x["w"],
+        )
+    ).rename("att_raw")
+    dfn = g.apply(
+        lambda x: np.average(
+            pd.to_numeric(x["goals_conceded"], errors="coerce").fillna(0.0),
+            weights=x["w"],
+        )
+    ).rename("def_raw")
+    out = (
+        pd.concat([att, dfn], axis=1).reset_index().rename(columns={"team": "team_id"})
+    )
 
     # Normalize by league averages
     league_att = float(out["att_raw"].mean()) if not out.empty else 1.3
@@ -66,7 +94,16 @@ def predict_fixtures(fixtures_json: dict, strengths: pd.DataFrame) -> pd.DataFra
     """
     fx = pd.DataFrame(fixtures_json)
     if fx.empty:
-        return pd.DataFrame(columns=["event", "team_id", "opp_id", "lambda_for", "lambda_against", "cs_prob"])
+        return pd.DataFrame(
+            columns=[
+                "event",
+                "team_id",
+                "opp_id",
+                "lambda_for",
+                "lambda_against",
+                "cs_prob",
+            ]
+        )
     fx = fx[["event", "team_h", "team_a"]].dropna()
     fx["event"] = fx["event"].astype(int)
     strengths = strengths.copy()
@@ -79,14 +116,21 @@ def predict_fixtures(fixtures_json: dict, strengths: pd.DataFrame) -> pd.DataFra
         base["lambda_for"] = 1.3
         base["lambda_against"] = 1.3
         base["cs_prob"] = np.exp(-base["lambda_against"])  # P(opponent scores 0)
+        base["ha"] = "?"
+        base["p_win"] = 0.33
+        base["p_draw"] = 0.34
+        base["p_lose"] = 0.33
         return base
 
     s = strengths.rename(columns={"team_id": "tid"})
     # Build rows for both home and away teams
     rows = []
     for _, r in fx.iterrows():
-        h = int(r["team_h"]); a = int(r["team_a"]); ev = int(r["event"])
-        sh = s[s["tid"] == h]; sa = s[s["tid"] == a]
+        h = int(r["team_h"])
+        a = int(r["team_a"])
+        ev = int(r["event"])
+        sh = s[s["tid"] == h]
+        sa = s[s["tid"] == a]
         if sh.empty or sa.empty:
             # Skip if strengths unavailable
             continue
@@ -94,12 +138,42 @@ def predict_fixtures(fixtures_json: dict, strengths: pd.DataFrame) -> pd.DataFra
         # baseline ~ 1.35 goals per team per match; mild home edge
         base = 1.35
         home_edge = 1.08
-        lam_h = base * home_edge * float(sh["att_str"].iloc[0]) / float(sa["def_str"].iloc[0])
+        lam_h = (
+            base
+            * home_edge
+            * float(sh["att_str"].iloc[0])
+            / float(sa["def_str"].iloc[0])
+        )
         lam_a = base * float(sa["att_str"].iloc[0]) / float(sh["def_str"].iloc[0])
         lam_h = float(np.clip(lam_h, 0.2, 3.2))
         lam_a = float(np.clip(lam_a, 0.2, 3.2))
-        rows.append({"event": ev, "team_id": h, "opp_id": a, "lambda_for": lam_h, "lambda_against": lam_a, "cs_prob": float(np.exp(-lam_a))})
-        rows.append({"event": ev, "team_id": a, "opp_id": h, "lambda_for": lam_a, "lambda_against": lam_h, "cs_prob": float(np.exp(-lam_h))})
+        p_h_win, p_draw, p_a_win = _poisson_grid_probs(lam_h, lam_a, max_goals=8)
+        rows.append(
+            {
+                "event": ev,
+                "team_id": h,
+                "opp_id": a,
+                "lambda_for": lam_h,
+                "lambda_against": lam_a,
+                "cs_prob": float(np.exp(-lam_a)),
+                "ha": "H",
+                "p_win": p_h_win,
+                "p_draw": p_draw,
+                "p_lose": p_a_win,
+            }
+        )
+        rows.append(
+            {
+                "event": ev,
+                "team_id": a,
+                "opp_id": h,
+                "lambda_for": lam_a,
+                "lambda_against": lam_h,
+                "cs_prob": float(np.exp(-lam_h)),
+                "ha": "A",
+                "p_win": p_a_win,
+                "p_draw": p_draw,
+                "p_lose": p_h_win,
+            }
+        )
     return pd.DataFrame(rows)
-
-

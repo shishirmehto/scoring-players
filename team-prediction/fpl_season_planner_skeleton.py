@@ -600,6 +600,21 @@ def main():
     current_squad_ids = _load_current_squad(args.current_squad, players)
 
     for gw, df in ep_by_gw.items():
+        # If using match model, emit team fixture predictions CSV
+        if bool(args.use_match_model):
+            try:
+                from season_planner.match_model import team_strengths_from_mgw, predict_fixtures
+                strengths = team_strengths_from_mgw(mgw)
+                team_preds = predict_fixtures(fixtures, strengths)
+                team_preds_gw = team_preds[team_preds["event"] == int(gw)][[
+                    "event", "team_id", "opp_id", "ha", "lambda_for", "lambda_against", "p_win", "p_draw", "p_lose", "cs_prob"
+                ]]
+                team_preds_gw.to_csv(
+                    os.path.join(args.output_dir, f"gw_{gw:02d}_team_fixture_predictions.csv"),
+                    index=False,
+                )
+            except Exception:
+                pass
         # Top-5 by position CSV
         top = df.sort_values(["ep"], ascending=False).groupby("position").head(5)
         top.to_csv(
