@@ -12,7 +12,9 @@ def chip_heuristics(gw: int, suggestions: dict, free_transfers: int) -> str:
     - Recommend WC/BB/TC/FH opportunistically based on projected gains.
     """
     if gw == 16:
-        return "GW16 AFCON top-up: free transfers are topped up to five. Arrive with 0 banked by GW15 to capture all five."
+        return (
+            "GW16 AFCON: FT top-up to five. Spend any banked FTs by end of GW15 to receive all five, then rebuild."
+        )
 
     total_gain = 0.0
     try:
@@ -26,6 +28,8 @@ def chip_heuristics(gw: int, suggestions: dict, free_transfers: int) -> str:
         return "Consider Wildcard to capture fixture swing (projected gain >= 12 over 4 GWs)."
 
     if gw <= 19:
-        return "First-half chips expire by GW19 deadline. Prioritize TC on a soft home fixture, BB when bench peaks, and FH for premium clashes if needed."
+        return (
+            "First-half chips expire by GW19. Use remaining TC/BB/FH before the GW19 deadline; WC earlier on a swing."
+        )
 
     return "No chip recommended by heuristics. Save for blanks/doubles in the run-in."

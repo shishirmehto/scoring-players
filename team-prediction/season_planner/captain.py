@@ -15,7 +15,7 @@ def captain_shortlist(
     risk_mode: str = "protect",
     top_k: int = 5,
     *,
-    def_guardrail_margin: float = 1.5,
+    def_guardrail_margin: float = 1.8,
 ) -> pd.DataFrame:
     df = ep_by_gw.get(gw, pd.DataFrame()).copy()
     if df.empty:
@@ -31,16 +31,22 @@ def captain_shortlist(
         pd.to_numeric(df["selected_by_percent"], errors="coerce").fillna(0.0) / 100.0
     )
     mean_own = float(df["ownership"].mean()) if len(df) else 0.0
-    std_own = float(df["ownership"].std()) if len(df) and df["ownership"].std() > 0 else 1.0
+    std_own = (
+        float(df["ownership"].std()) if len(df) and df["ownership"].std() > 0 else 1.0
+    )
     df["eo_z"] = (df["ownership"] - mean_own) / std_own
 
     # Risk tilt
     if risk_mode == "chase":
         # Downweight high-EO; upweight low-EO
-        df["cap_score"] = df["ep"] * (1.0 - 0.20 * df["eo_z"].clip(lower=-2.0, upper=2.0))
+        df["cap_score"] = df["ep"] * (
+            1.0 - 0.20 * df["eo_z"].clip(lower=-2.0, upper=2.0)
+        )
     else:
-        # Protect: upweight high-EO
-        df["cap_score"] = df["ep"] * (1.0 + 0.20 * df["eo_z"].clip(lower=-2.0, upper=2.0))
+        # Protect: upweight high-EO more strongly
+        df["cap_score"] = df["ep"] * (
+            1.0 + 0.30 * df["eo_z"].clip(lower=-2.0, upper=2.0)
+        )
 
     # DEF guardrail in protect mode: require margin over best attacker
     if risk_mode == "protect":

@@ -47,7 +47,9 @@ def _availability_penalty(status: pd.Series, chance: pd.Series) -> np.ndarray:
 
 
 def _minutes_proxy(mins60: pd.Series) -> pd.Series:
-    return 35.0 + 55.0 * pd.to_numeric(mins60, errors="coerce").fillna(0.5)
+    x = 35.0 + 55.0 * pd.to_numeric(mins60, errors="coerce").fillna(0.5)
+    # Clamp to reduce variance extremes
+    return x.clip(lower=30.0, upper=88.0)
 
 
 def _base_form(df_players: pd.DataFrame) -> pd.Series:
@@ -165,12 +167,12 @@ def ep_per_gw(
         diff = pd.to_numeric(df["diff"], errors="coerce").fillna(3.0)
         if opponent_split:
             # Stronger for attackers, milder for defenders
-            att_adj = 1.0 + (3.0 - diff) * 0.08
-            def_adj = 1.0 + (3.0 - diff) * 0.05
+            att_adj = (1.0 + (3.0 - diff) * 0.08).clip(lower=0.85, upper=1.15)
+            def_adj = (1.0 + (3.0 - diff) * 0.05).clip(lower=0.90, upper=1.12)
             is_att = df["position"].isin(["MID", "FWD"])
             fixture_adj = np.where(is_att, att_adj, def_adj)
         else:
-            fixture_adj = 1.0 + (3.0 - diff) * 0.06
+            fixture_adj = (1.0 + (3.0 - diff) * 0.06).clip(lower=0.88, upper=1.14)
 
         ep = (df["xmins"] / 90.0) * df["base"] * fixture_adj * (
             1.0 + df["pos_boost"]
